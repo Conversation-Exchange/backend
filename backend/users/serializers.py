@@ -11,7 +11,9 @@ from core.constants import (MAX_AGE, MAX_FOREIGN_LANGUAGES,
                             MAX_NATIVE_LANGUAGES, MIN_AGE)
 from users.fields import Base64ImageField, CreatableSlugRelatedField
 from users.models import (BlacklistEntry, Country, Goal, Interest, Language,
-                          Report, User, UserLanguage)
+                          Report, Review, User, UserLanguage)
+
+from .validators import ReportDescriptionValidator, ReviewTextValidator
 
 
 class LanguageSerializer(serializers.ModelSerializer):
@@ -88,6 +90,36 @@ class GoalSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
+class UserShortSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = (
+            'slug',
+            'username',
+            'first_name',
+            'avatar',
+        )
+        read_only_fields = fields
+
+
+class ReviewSerializer(serializers.ModelSerializer):
+    author = UserShortSerializer()
+    recipient = UserShortSerializer()
+
+    class Meta:
+        model = Review
+        fields = '__all__'
+
+
+class ReviewCreateSerializer(serializers.ModelSerializer):
+    text = serializers.CharField(validators=[ReviewTextValidator()])
+    is_approved = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = Review
+        fields = ('text', 'is_approved')
+
+
 class UserReprSerializer(serializers.ModelSerializer):
     """Сериализатор для просмотра пользователя."""
 
@@ -113,6 +145,10 @@ class UserReprSerializer(serializers.ModelSerializer):
         source='get_role_display',
         read_only=True
     )
+    is_blocked = serializers.BooleanField(
+        source='get_is_blocked',
+        read_only=True
+    )
 
     class Meta:
         model = User
@@ -133,6 +169,7 @@ class UserReprSerializer(serializers.ModelSerializer):
             'gender_is_hidden',
             'age_is_hidden',
             'role',
+            'is_blocked',
         )
         read_only_fields = fields
 
@@ -149,6 +186,12 @@ class UserReprSerializer(serializers.ModelSerializer):
             return int(age_days / 365)
         return None
 
+    def get_is_blocked(self, obj):
+        current_user = self.context['request'].user
+        return obj.blacklist_entries_received.filter(
+            user=current_user
+        ).exists()
+
 
 class UserProfileSerializer(DjoserSerializer, UserReprSerializer):
     """Сериализатор для заполнения профиля пользователя."""
@@ -161,7 +204,7 @@ class UserProfileSerializer(DjoserSerializer, UserReprSerializer):
         many=False,
         read_only=False,
         required=False,
-        slug_field='code',
+        slug_field='name',
         queryset=Country.objects.all()
     )
     interests = CreatableSlugRelatedField(
@@ -184,6 +227,7 @@ class UserProfileSerializer(DjoserSerializer, UserReprSerializer):
         read_only=False,
         required=False
     )
+    reviews = ReviewSerializer(many=True, read_only=True)
 
     default_error_messages = {
         'out_of_range': (
@@ -198,6 +242,7 @@ class UserProfileSerializer(DjoserSerializer, UserReprSerializer):
         model = User
         fields = UserReprSerializer.Meta.fields + (
             'birth_date',
+            'reviews',
         )
         read_only_fields = (
             'username',
@@ -255,19 +300,8 @@ class UserProfileSerializer(DjoserSerializer, UserReprSerializer):
         return super().update(instance, validated_data)
 
 
-class UserShortSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = User
-        fields = (
-            'slug',
-            'username',
-            'first_name',
-            'avatar',
-        )
-        read_only_fields = fields
-
-
 class BlacklistEntrySerializer(serializers.ModelSerializer):
+    """Сериализатор блокировки"""
     class Meta:
         model = BlacklistEntry
         fields = '__all__'
@@ -275,9 +309,19 @@ class BlacklistEntrySerializer(serializers.ModelSerializer):
 
 
 class ReportSerializer(serializers.ModelSerializer):
+    """Сериализатор жалоб"""
+    description = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        validators=[ReportDescriptionValidator()]
+    )
+    close_user_access = serializers.BooleanField(
+        help_text="Закрыть пользователю доступ к моей странице",
+    )
+
     class Meta:
         model = Report
-        fields = ('reason', 'description')
+        fields = ('reason', 'description', 'close_user_access')
         read_only_fields = ('reported_user',)
 
 

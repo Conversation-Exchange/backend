@@ -1,5 +1,8 @@
 """View-функции приложения users."""
 
+from datetime import timedelta
+
+from django.contrib.auth.models import AnonymousUser
 from django.db.models import Count, Q
 from django.utils import timezone
 
@@ -10,17 +13,20 @@ from drf_spectacular.utils import (OpenApiExample, OpenApiParameter,
                                    inline_serializer)
 from rest_framework import filters, mixins, serializers, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 
+from chats.models import PersonalChat
 from core.permissions import (CanAccessProfileDetails,
                               IsAdminOrModeratorReadOnly)
 from users.filters import UserFilter
 from users.models import (BlacklistEntry, Country, Goal, Interest, Language,
-                          Report, User)
+                          Report, Review, User)
 from users.serializers import (CountrySerializer, GoalSerializer,
                                InterestSerializer, LanguageSerializer,
-                               ReportSerializer, UserProfileSerializer,
+                               ReportSerializer, ReviewCreateSerializer,
+                               ReviewSerializer, UserProfileSerializer,
                                UserReprSerializer)
 
 
@@ -112,11 +118,38 @@ class UserViewSet(DjoserViewSet):
     ordering_fields = ['date_joined']
     ordering = ['?']
     lookup_field = 'slug'
-    http_method_names = ['get', 'post', 'patch', 'delete']
+    http_method_names = ['get', 'post', 'patch', 'delete', 'put']
 
     def get_queryset(self):
         """Исключение админов и модераторов из выборки."""
         return User.objects.filter(Q(is_staff=False) | Q(role="User"))
+
+    # def get_permissions(self):
+
+    #     if self.action == 'reviews':
+    #         return [UnauthenticatedUserReviewPermission()]
+
+    #     return [CanAccessProfileDetails()]
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        current_user = request.user
+
+        if instance == current_user:
+            serializer = self.get_serializer(instance)
+            return Response(serializer.data)
+
+        blocked_chats = PersonalChat.objects.filter(
+            Q(initiator=instance, blocked_users=current_user) |
+            Q(receiver=instance, blocked_users=current_user)
+        )
+
+        if blocked_chats.exists():
+            raise PermissionDenied(
+                "Вы заблокированы и не можете просматривать этот профиль.")
+
+        serializer = self.get_serializer(instance)
+        return Response(serializer.data)
 
     @extend_schema(
         summary='Редактировать свой профиль',
@@ -126,7 +159,7 @@ class UserViewSet(DjoserViewSet):
     @extend_schema(
         summary='Просмотреть свой профиль',
         description='Просмотреть свой профиль',
-        methods=["get"],
+        methods=["get"]
     )
     @extend_schema(
         summary='Удалить свой аккаунт',
@@ -233,6 +266,90 @@ class UserViewSet(DjoserViewSet):
             status=status.HTTP_400_BAD_REQUEST
         )
 
+    @action(
+        detail=True, methods=['get', 'post', 'put'],
+        permission_classes=[AllowAny]
+    )
+    def reviews(self, request, slug=None):
+        user = self.get_object()
+
+        if request.method == 'POST':
+            if isinstance(request.user, AnonymousUser):
+                return Response(
+                    {"detail": "Только аутентифицированные пользователи могут"
+                     " оставлять отзывы."},
+                    status=status.HTTP_401_UNAUTHORIZED
+                )
+
+            if user == request.user:
+                return Response(
+                    {"detail": "Вы не можете оставить отзыв на самого себя."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+            last_review = Review.objects.filter(
+                author=request.user, recipient=user
+            ).order_by('-date_created').first()
+            if last_review:
+                time_since_last_review = (
+                    timezone.now() - last_review.date_created
+                )
+
+                if time_since_last_review < timedelta(days=7):
+                    return Response(
+                        {"detail": "Вы можете отправить новый"
+                         " отзыв только раз в неделю."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            serializer = ReviewCreateSerializer(data=request.data)
+            if serializer.is_valid():
+                serializer.save(
+                    recipient=user, author=request.user, is_approved=False)
+                return Response(
+                    {"detail": "Отзыв успешно создан и ожидает модерации"},
+                    status=status.HTTP_201_CREATED
+                )
+            return Response(
+                serializer.errors,
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        elif request.method == 'PUT':
+            if isinstance(request.user, AnonymousUser):
+                return Response(
+                    {"detail": "Только аутентифицированные пользователи могут"
+                     " редактировать отзывы."},
+                    status=status.HTTP_401_UNAUTHORIZED
+                )
+
+            review_id = request.data.get('review_id')
+            review = Review.objects.get(id=review_id)
+
+            if review.author == request.user:
+                review.is_approved = False
+                review.text = request.data.get('text')
+                review.save()
+                return Response(
+                    {"detail": "Отзыв успешно обновлен и и ожидает модерации"},
+                    status=status.HTTP_200_OK
+                )
+            else:
+                return Response(
+                    {"detail": "Вы не можете редактировать этот отзыв,"
+                     " так как вы не являетесь его автором."},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
+        reviews = Review.objects.filter(recipient=user, is_approved=True)
+        if not reviews.exists():
+            return Response(
+                {"detail":
+                 "Отзывов пока нет, или проходят модерацию"},
+                status=status.HTTP_200_OK
+            )
+
+        serializer = ReviewSerializer(reviews, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
     @extend_schema(
         summary='Просмотреть все жалобы на пользователя',
         description=(
@@ -250,45 +367,58 @@ class UserViewSet(DjoserViewSet):
         methods=["post", "get"],
         detail=True,
         permission_classes=(IsAuthenticated, IsAdminOrModeratorReadOnly),
-        serializer_class=None
+        serializer_class=ReportSerializer
     )
     def report_user(self, request, slug=None):
         """Просмотр и отправка жалоб."""
         user = self.get_object()
         current_user = request.user
 
+        if user == current_user:
+            return Response(
+                {"detail": "Вы не можете отправлять жалобу на самого себя."},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         if request.method == 'POST':
             existing_report = Report.objects.filter(
                 user=current_user, reported_user=user).first()
 
             if existing_report and (
-                    existing_report.date_created + timezone.timedelta(weeks=1)
-                    > timezone.now()
+                existing_report.date_created +
+                timezone.timedelta(weeks=1)
+                > timezone.now()
             ):
                 return Response(
                     {"detail": "Вы не можете отправлять жалобу часто."},
                     status=status.HTTP_400_BAD_REQUEST
                 )
+            serializer = ReportSerializer(
+                data=request.data, context={'request': request})
+            if serializer.is_valid():
+                close_user_access = serializer.validated_data.get(
+                    "close_user_access", False)
 
-            if existing_report:
-                existing_report.date_created = timezone.now()
-                existing_report.reason = request.data.get(
-                    'reason', existing_report.reason)
-                existing_report.description = request.data.get(
-                    'description', existing_report.description)
-                existing_report.save()
-            else:
-                serializer = ReportSerializer(data=request.data)
-                if serializer.is_valid():
-                    serializer.save(user=current_user, reported_user=user)
-                else:
-                    return Response(
-                        serializer.errors, status=status.HTTP_400_BAD_REQUEST
-                    )
+                existing_block_entry = BlacklistEntry.objects.filter(
+                    user=current_user, blocked_user=user
+                ).first()
 
+                if close_user_access:
+                    if existing_block_entry:
+                        existing_block_entry.save()
+                    else:
+                        BlacklistEntry.objects.create(
+                            user=current_user,
+                            blocked_user=user,
+                        )
+
+                serializer.save(user=current_user, reported_user=user)
+                return Response(
+                    {"detail": "Жалоба успешно отправлена."},
+                    status=status.HTTP_200_OK
+                )
             return Response(
-                {"detail": "Жалоба успешно отправлена."},
-                status=status.HTTP_200_OK
+                serializer.errors, status=status.HTTP_400_BAD_REQUEST
             )
 
         reports = Report.objects.filter(reported_user=user)

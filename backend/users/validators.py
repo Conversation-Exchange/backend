@@ -126,3 +126,42 @@ def validate_first_name(value):
     ):
         raise ValidationError(
             _('Длина имени должна быть от 2 до 12 символов.'))
+
+
+class ReportDescriptionValidator:
+    """
+    Валадатор поля description
+    """
+
+    def __call__(self, value):
+
+        valid_chars = re.compile(
+            r'^[0-9a-zA-ZА-Яа-я?!@#%^$*+&_\-\\();:,./\s]*$')
+        if not valid_chars.match(value):
+            raise ValidationError(
+                "Описание содержит недопустимые символы.")
+
+        if len(value) < 6:
+            raise ValidationError(
+                "Описание слишком короткое. Минимум 6 символов.")
+
+        if len(value) > 1000:
+            raise ValidationError(
+                "Описание слишком длинное. Максимум 1000 символов.")
+
+
+class ReviewTextValidator:
+    def __call__(self, value):
+
+        allowed_chars_pattern = (
+            r'^[0-9a-zA-Zа-яА-Я?!\@\#%\^\$\*\+\&\_\-\(\)\[\]\{\}\/\:\;,.' +
+            r']+$'
+        )
+
+        if not re.match(allowed_chars_pattern, value):
+            raise ValidationError(
+                "В отзыве присутствуют недопустимые символы.")
+
+        if len(value) < 6 or len(value) > 1000:
+            raise ValidationError(
+                "Отзыв должен содержать от 6 до 1000 символов.")
